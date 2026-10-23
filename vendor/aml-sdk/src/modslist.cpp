@@ -1,0 +1,403 @@
+#include <modslist.h>
+#include <modpaks.h>
+#include <unistd.h>
+#include <mod/logger.h>
+#include <mod/listitem.h>
+
+extern ModDesc* pLastModProcessed;
+extern int g_nFailedToLoad, g_nLatestDownloadErrorCode;
+
+Mods* listMods = NULL;
+LIST_START(Mods)
+
+    LIST_INITSTART(Mods)
+        pModInfo = NULL;
+        pModDesc = NULL;
+        pHandle = NULL;
+    LIST_INITEND()
+
+    static void AddNew(ModInfo* info, void* libhandle, const char* path)
+    {
+        Mods* newItem = new Mods;
+        newItem->pModInfo = info;
+        newItem->pHandle = libhandle;
+
+        ModDesc* d = new ModDesc();
+        d->m_pInfo = info;
+        d->m_pHandle = libhandle;
+        d->m_aDependencies = NULL;
+        if(path) snprintf(d->m_szLibPath, 256, "%s", path);
+        else d->m_szLibPath[0] = 0;
+        if(libhandle != NULL)
+        {
+            GetDependenciesListFn getDepList = (GetDependenciesListFn)dlsym(libhandle, "__GetDepsList");
+            if(getDepList != NULL) d->m_aDependencies = getDepList();
+        }
+        newItem->pModDesc = d;
+        
+        newItem->Push(&listMods);
+    }
+    static Mods* Get(const char* guid)
+    {
+        LIST_FOR_FAST(listMods)
+        {
+            if (!strcmp(item->pModInfo->szGUID, guid)) return item;
+        }
+        return NULL;
+    }
+
+    ModInfo* pModInfo;
+    ModDesc* pModDesc;
+    void* pHandle;
+LIST_END()
+
+bool ModsList::AddMod(ModInfo* modInfo, void* modhandle, const char* path)
+{
+    if(modInfo == NULL || modInfo->szGUID[0] == 0) return false;
+    if(Mods::Get(modInfo->szGUID) != NULL) return false;
+    Mods::AddNew(modInfo, modhandle, path);
+    return true;
+}
+
+bool ModsList::RemoveMod(ModInfo* modInfo)
+{
+    LIST_FOR(listMods)
+    {
+        if(item->pModInfo == modInfo)
+        {
+            dlclose(item->pHandle);
+            if(item->Remove(&listMods))
+            {
+                delete item->pModDesc;
+                delete item;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ModsList::RemoveMod(const char* szGUID)
+{
+    LIST_FOR(listMods)
+    {
+        if(!strcmp(item->pModInfo->szGUID, szGUID))
+        {
+            dlclose(item->pHandle);
+            if(item->Remove(&listMods))
+            {
+                delete item->pModDesc;
+                delete item;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ModsList::HasMod(const char* szGUID)
+{
+    LIST_FOR_FAST(listMods)
+    {
+        if(!strcmp(item->pModInfo->szGUID, szGUID))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ModsList::HasModOfVersion(const char* szGUID, const char* szVersion)
+{
+    if(szVersion[0] == '\0') return HasMod(szGUID);
+    unsigned short major = 0, minor = 0, revision = 0, build = 0;
+    if(sscanf(szVersion, "%hu.%hu.%hu.%hu", &major, &minor, &revision, &build) < 4)
+    {
+        if(sscanf(szVersion, "%hu.%hu.%hu", &major, &minor, &revision) < 3)
+        {
+            if(sscanf(szVersion, "%hu.%hu", &major, &minor) < 2)
+            {
+                major = (unsigned short)atoi(szVersion);
+            }
+        }
+    }
+
+    ModInfo* pInfo = NULL;
+    LIST_FOR_FAST(listMods)
+    {
+        pInfo = item->pModInfo;
+        if(!strcmp(pInfo->szGUID, szGUID))
+        {
+            if(pInfo->version.major > major) return true;
+            if(pInfo->version.major == major)
+            {
+                if(pInfo->version.minor > minor) return true;
+                if(pInfo->version.minor == minor)
+                {
+                    if(pInfo->version.revision > revision) return true;
+                    if(pInfo->version.revision == revision && pInfo->version.build >= build) return true;
+                }
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+bool ModsList::HasModOfBiggerVersion(const char* szGUID, const char* szVersion)
+{
+    if(szVersion[0] == '\0') return HasMod(szGUID);
+    unsigned short major = 0, minor = 0, revision = 0, build = 0;
+    if(sscanf(szVersion, "%hu.%hu.%hu.%hu", &major, &minor, &revision, &build) < 4)
+    {
+        if(sscanf(szVersion, "%hu.%hu.%hu", &major, &minor, &revision) < 3)
+        {
+            if(sscanf(szVersion, "%hu.%hu", &major, &minor) < 2)
+            {
+                major = (unsigned short)atoi(szVersion);
+            }
+        }
+    }
+
+    ModInfo* pInfo = NULL;
+    LIST_FOR_FAST(listMods)
+    {
+        pInfo = item->pModInfo;
+        if(!strcmp(pInfo->szGUID, szGUID))
+        {
+            if(pInfo->version.major > major) return true;
+            if(pInfo->version.major == major)
+            {
+                if(pInfo->version.minor > minor) return true;
+                if(pInfo->version.minor == minor)
+                {
+                    if(pInfo->version.revision > revision) return true;
+                    if(pInfo->version.revision == revision && pInfo->version.build > build) return true;
+                }
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+void ModsList::ProcessDependencies()
+{
+    ModInfoDependency* depList;
+    ModInfo* info;
+
+  label_run_dependencies_check:
+    //logger->Info("Checking dependencies from the start! Mods count: %d", modlist->GetModsNum());
+    LIST_FOR_FAST(listMods)
+    {
+        // If the mod is already ok or doesnt require check, depList = NULL
+        depList = item->pModDesc->m_aDependencies;
+        if(depList)
+        {
+            info = item->pModInfo;
+            for(int i = 0; depList[i].szGUID && depList[i].szGUID[0] != 0; ++i)
+            {
+                if(depList[i].szVersion)
+                {
+                    if(!HasModOfVersion(depList[i].szGUID, depList[i].szVersion))
+                    {
+                        logger->Error("Mod (GUID %s) requires a mod %s of version %s and newer", info->szGUID, depList[i].szGUID, depList[i].szVersion);
+                        ModsList::RemoveMod(info);
+                        ++g_nFailedToLoad;
+                        goto label_run_dependencies_check;
+                    }
+                }
+                else
+                {
+                    if(!HasMod(depList[i].szGUID))
+                    {
+                        logger->Error("Mod (GUID %s) requires a mod %s of any version", info->szGUID, depList[i].szGUID);
+                        ModsList::RemoveMod(info);
+                        ++g_nFailedToLoad;
+                        goto label_run_dependencies_check;
+                    }
+                }
+            }
+
+            // Everything is okay, we dont need to check it again!
+            item->pModDesc->m_aDependencies = NULL;
+        }
+    }
+}
+
+void ModsList::ProcessPreLoading()
+{
+    OnModLoadFn onModPreLoadFn;
+    ModDesc* desc;
+    void* handle;
+    LIST_FOR_FAST(listMods)
+    {
+        handle = item->pHandle;
+        if(handle != NULL)
+        {
+            desc = item->pModDesc;
+            pLastModProcessed = desc;
+
+            onModPreLoadFn = (OnModLoadFn)dlsym(handle, "OnModPreLoad");
+            //if(onModPreLoadFn == NULL) onModPreLoadFn = (OnModLoadFn)dlsym(handle, "_Z12OnModPreLoadv");
+            if(onModPreLoadFn != NULL) onModPreLoadFn();
+
+            desc->m_fnOnModLoaded = (OnModLoadFn)dlsym(handle, "OnModLoad");
+            //if(desc->m_fnOnModLoaded == NULL) desc->m_fnOnModLoaded = (OnModLoadFn)dlsym(handle, "_Z9OnModLoadv");
+
+            desc->m_fnOnModUnloaded = (OnModLoadFn)dlsym(handle, "OnModUnload");
+            //if(desc->m_fnOnModUnloaded == NULL) desc->m_fnOnModUnloaded = (OnModLoadFn)dlsym(handle, "_Z11OnModUnloadv");
+
+            desc->m_fnRequestUpdaterURL = (GetUpdaterURLFn)dlsym(handle, "OnUpdaterURLRequested");
+            //if(desc->m_fnRequestUpdaterURL == NULL) desc->m_fnRequestUpdaterURL = (GetUpdaterURLFn)dlsym(handle, "_Z21OnUpdaterURLRequestedv");
+
+            desc->m_fnInterfaceAddedCB = (OnInterfaceAddedFn)dlsym(handle, "OnInterfaceAdded");
+            //if(desc->m_fnInterfaceAddedCB == NULL) desc->m_fnInterfaceAddedCB = (OnInterfaceAddedFn)dlsym(handle, "_Z16OnInterfaceAddedPKcPKv");
+
+            desc->m_fnOnAllModsLoaded = (OnModLoadFn)dlsym(handle, "OnAllModsLoaded");
+            //if(desc->m_fnOnAllModsLoaded == NULL) desc->m_fnOnAllModsLoaded = (OnModLoadFn)dlsym(handle, "_Z15OnAllModsLoadedv");
+
+            desc->m_fnGameCrashedCB = (OnGameCrashedFn)dlsym(handle, "OnGameCrash");
+            //if(desc->m_fnGameCrashedCB == NULL) desc->m_fnGameCrashedCB = (OnGameCrashedFn)dlsym(handle, "_Z11OnGameCrashv");
+        }
+    }
+    logger->Info("Mods were preloaded!");
+}
+
+void ModsList::ProcessLoading()
+{
+    ModDesc* desc = NULL;
+    LIST_FOR_FAST(listMods)
+    {
+        desc = item->pModDesc;
+        pLastModProcessed = desc;
+        if(desc->m_fnOnModLoaded) desc->m_fnOnModLoaded();
+    }
+    logger->Info("Mods were loaded!");
+}
+
+void ModsList::ProcessUnloading()
+{
+    ModDesc* desc = NULL;
+    LIST_FOR_FAST(listMods)
+    {
+        desc = item->pModDesc;
+        pLastModProcessed = desc;
+        if(desc->m_fnOnModUnloaded) desc->m_fnOnModUnloaded();
+    }
+}
+
+void ModsList::ProcessUpdater()
+{
+    ModDesc* desc = NULL;
+    LIST_FOR_FAST(listMods)
+    {
+        desc = item->pModDesc;
+        pLastModProcessed = desc;
+        if(desc->m_fnRequestUpdaterURL)
+        {
+            const char* url = desc->m_fnRequestUpdaterURL();
+            if(DownloadFileToData(url))
+            {
+                ProcessData(desc);
+            }
+            else
+            {
+                logger->Error("Updater failed to determine an update info for %s, err %d", desc->m_pInfo->GUID(), g_nLatestDownloadErrorCode);
+            }
+        }
+    }
+}
+
+void ModsList::ProcessCrash(const char* szLibName, int sig, int code, uintptr_t libaddr, mcontext_t* mcontext)
+{
+    ModDesc* desc = NULL;
+    LIST_FOR_FAST(listMods)
+    {
+        desc = item->pModDesc;
+        pLastModProcessed = desc;
+        if(desc->m_fnGameCrashedCB) desc->m_fnGameCrashedCB(szLibName, sig, code, libaddr, mcontext);
+    }
+}
+
+int ModsList::GetModsNum()
+{
+    return listMods ? listMods->Count() : 0;
+}
+
+static char signalbuf[1024];
+#define fd_printf(format, ...) \
+    do{ int _macro_len = snprintf(signalbuf, sizeof(signalbuf), format, ##__VA_ARGS__); \
+        if(_macro_len > 0) write(g_nLogFileFd, signalbuf, _macro_len); } while(0)
+void ModsList::PrintModsList(int g_nLogFileFd)
+{
+    fd_printf("\n----------------------------------------------------\nList of loaded mods (count=%d):\n", GetModsNum());
+
+    ModInfo* info = NULL;
+    ModDesc* desc = NULL;
+    LIST_FOR_REVERSE_FAST(listMods)
+    {
+        info = item->pModInfo;
+        desc = item->pModDesc;
+        
+        fd_printf("%s (%s, version %s)\n", info->Name(), info->Author(), info->VersionString());
+        fd_printf(" - GUID: %s | Base: " PTRFMT " | Path: %s\n", info->GUID(), (uintptr_t)desc->m_pHandle, desc->m_szLibPath);
+    }
+}
+
+void ModsList::OnInterfaceAdded(const char* name, const void* ptr)
+{
+    ModDesc* desc = NULL;
+    LIST_FOR_FAST(listMods)
+    {
+        desc = item->pModDesc;
+        pLastModProcessed = desc;
+        if(desc->m_fnInterfaceAddedCB) desc->m_fnInterfaceAddedCB(name, ptr);
+    }
+}
+
+void ModsList::OnAllModsLoaded()
+{
+    ModDesc* desc = NULL;
+    LIST_FOR_FAST(listMods)
+    {
+        desc = item->pModDesc;
+        pLastModProcessed = desc;
+        if(desc->m_fnOnAllModsLoaded) desc->m_fnOnAllModsLoaded();
+    }
+    logger->Info("Mods were postloaded!");
+}
+
+void ModsList::ListMods(_ListModsCallback cb, void* data, bool startWithLatest)
+{
+    if(!cb) return;
+
+    char szGUID[sizeof(ModInfo::szGUID)], szVersion[sizeof(ModInfo::szVersion)];
+    if(startWithLatest)
+    {
+        // Start from the latest mod
+        LIST_FOR_FAST(listMods)
+        {
+            ModInfo* info = item->pModInfo;
+
+            strxcpy(szGUID, info->GUID(), sizeof(szGUID)); szGUID[sizeof(szGUID) - 1] = '\0';
+            strxcpy(szVersion, info->VersionString(), sizeof(szVersion)); szVersion[sizeof(szVersion) - 1] = '\0';
+            cb(szGUID, info->VersionString(), data);
+        }
+    }
+    else
+    {
+        // Start from AMLCore
+        LIST_FOR_REVERSE_FAST(listMods)
+        {
+            ModInfo* info = item->pModInfo;
+            
+            strxcpy(szGUID, info->GUID(), sizeof(szGUID)); szGUID[sizeof(szGUID) - 1] = '\0';
+            strxcpy(szVersion, info->VersionString(), sizeof(szVersion)); szVersion[sizeof(szVersion) - 1] = '\0';
+            cb(szGUID, szVersion, data);
+        }
+    }
+}
+
+static ModsList modlistLocal;
+ModsList* modlist = &modlistLocal;

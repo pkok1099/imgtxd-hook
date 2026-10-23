@@ -1,0 +1,7 @@
+{
+  global:
+    __GetModInfo;
+    OnModLoad;
+  local:
+    *;
+};

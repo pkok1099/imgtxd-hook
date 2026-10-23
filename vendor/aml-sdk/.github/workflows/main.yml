@@ -1,0 +1,35 @@
+name: AML Mod Compiler
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+
+    - name: Checking out repository...
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Installing Android NDK (r24)...
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r24
+        # local-cache: true # caching breaks Unwind lib
+
+    - name: Building ARMPatch...
+      run: ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=./ARMPatch/armpatch_src/Android.mk NDK_APPLICATION_MK=./ARMPatch/armpatch_src/Application.mk NDK_DEBUG=0 -j12
+      
+    - name: Building AML...
+      run: ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk NDK_DEBUG=0 -j12
+
+    - name: Finished. Uploading the results.
+      uses: actions/upload-artifact@v4
+      with:
+        name: AML_Libraries
+        path: ./libs/**/libAML.so

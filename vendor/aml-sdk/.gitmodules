@@ -1,0 +1,6 @@
+[submodule "ARMPatch"]
+	path = ARMPatch
+	url = https://github.com/RusJJ/ARMPatch
+[submodule "AML_PrecompiledLibs"]
+	path = AML_PrecompiledLibs
+	url = https://github.com/RusJJ/AML_PrecompiledLibs
